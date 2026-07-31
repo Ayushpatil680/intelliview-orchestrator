@@ -58,7 +58,7 @@ class AudioAnalysisResult(TypedDict):
     risk_score: float
 
 
-def _real_transcribe(session_id: str, audio_url: str | None = None) -> dict[str, Any] | None:
+def _real_transcribe(session_id: str, audio_url: str | None = None) -> TranscriptionResult | None:
     """Transcribe audio using local Whisper model."""
     import tempfile
     import urllib.request
@@ -73,53 +73,46 @@ def _real_transcribe(session_id: str, audio_url: str | None = None) -> dict[str,
             logger.debug("Transcription skipped: no audio URL configured.")
             return None
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            audio_path = os.path.join(temp_dir, f"interview_{session_id}.wav")
-            try:
-                urllib.request.urlretrieve(url, audio_path)
-            except Exception as e:
-                logger.warning("Error downloading audio for session %s from %s: %s", session_id, url, e)
-                return None
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=AUDIO_TEMP_DIR) as temp_file:
+            audio_path = temp_file.name
 
+        try:
+            urllib.request.urlretrieve(url, audio_path)
+        except Exception as e:
+            logger.warning("Error downloading audio for session %s from %s: %s", session_id, url, e)
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+            return None
+
+        try:
             # Check if the audio file is empty
             if os.path.getsize(audio_path) == 0:
-                logger.warning(
-                    "Audio file is empty (0 bytes) for session %s: %s",
-                    session_id,
-                    audio_path,
-                )
+                logger.warning("Audio file is empty (0 bytes) for session %s: %s", session_id, audio_path)
                 return None
 
             result = transcribe_audio_file(audio_path)
-            segments = result.get("segments", [])
+            if result is None:
+                return None
 
-            if segments:
-                avg_logprob = np.mean([s.get("avg_logprob", -1.0) for s in segments])
-
-                confidence = round(
-                    max(0.0, min(1.0, 1.0 + avg_logprob)),
-                    3,
-                )
-            else:
-                confidence = 0.0
-                avg_logprob = 0.0
-
-            logger.info(
-                "avg_logprob=%s, confidence=%s",
-                avg_logprob,
-                confidence,
+            return TranscriptionResult(
+                text=result.get("text", ""),
+                confidence=result.get("confidence", 0.0),
+                language=result.get("language", "en"),
+                duration_seconds=result.get("duration_seconds", 0.0),
+                timestamp=time.time(),
             )
-
-            return {
-                "text": result.get("text", ""),
-                "confidence": confidence,
-                "language": result.get("language", "en"),
-                "duration_seconds": (sum(s.get("end", 0) - s.get("start", 0) for s in segments) or 120.0),
-                "timestamp": time.time(),
-            }
+        finally:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
 
     except ImportError:
         logger.info("Whisper not installed, using stub fallback")
+        return None
+    except FileNotFoundError:
+        logger.warning("Audio file not found for session %s", session_id)
+        return None
+    except Exception as exc:
+        logger.warning("Real transcription failed for session %s: %s", session_id, exc)
         return None
 
     except FileNotFoundError:
